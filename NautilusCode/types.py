@@ -1,3 +1,4 @@
+import json
 import os
 from gettext import gettext as _
 
@@ -57,6 +58,50 @@ class Native (Package):
           lines.insert(-1, f"  command = {os.path.basename(self.cmd_path)}")
         elif self.commands:
           lines.insert(-1, f"  command(s) = " + ', '.join(self.commands))
+        return  '\n'.join(lines)
+
+
+class Toolbox (Package):
+    type_name = _('Toolbox')
+    state_file = os.path.join(user_data_dir, 'JetBrains', 'Toolbox', 'state.json')
+    _tools = None
+
+    @classmethod
+    def _load_tools (cls):
+        if cls._tools is None:
+            try:
+                with open(cls.state_file, encoding='utf-8') as f:
+                    cls._tools = json.load(f).get('tools', []) or []
+            except (OSError, ValueError):
+                cls._tools = []
+        return cls._tools
+
+    def __init__ (self, *tool_ids):
+      self.tool_ids = tool_ids
+      self.launch_command = ''
+      for tool in self._load_tools():
+        if tool.get('toolId') in tool_ids:
+          cmd = tool.get('launchCommand', '')
+          if cmd and os.path.exists(cmd):
+            self.launch_command = cmd
+            break
+
+    @property
+    def run_command (self) -> tuple[str]:
+        '''The command that should be executed in order to
+           run a program using this type of package'''
+        return (self.launch_command,)
+
+    @property
+    def is_installed (self) -> bool:
+        return bool(self.launch_command)
+
+    def __str__ (self):
+        lines = super().__str__().splitlines()
+        if self.launch_command:
+          lines.insert(-1, f"  command = {self.launch_command}")
+        elif self.tool_ids:
+          lines.insert(-1, f"  tool_id(s) = " + ', '.join(self.tool_ids))
         return  '\n'.join(lines)
 
 

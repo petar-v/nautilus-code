@@ -1,6 +1,6 @@
 from gettext import gettext as _
 
-from .types import ProgramList, Program, Native, Flatpak
+from .types import ProgramList, Program, Native, Flatpak, Toolbox
 
 progs = ProgramList()
 
@@ -112,7 +112,8 @@ progs += Program('phpstorm-eap', _("PhpStorm (EAP)"),
 # prioritise the highest-paying edition. Therefore the native version has been
 # treated as a separate program due to the uncertainty around edition.
 progs += Program('pycharm', _('PyCharm'),
-		 Native('pycharm'))
+		 Native('pycharm'),
+		 Toolbox('PyCharm', 'PyCharm-P', 'PyCharm-C'))
 
 progs += Program('pycharm-eap', _('PyCharm (EAP)'),
 		 Native('pycharm-eap'))
