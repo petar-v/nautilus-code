@@ -47,6 +47,10 @@ progs += Program('android-studio', _('Android Studio'),
                  Native('studio'),
                  Flatpak('com.google.AndroidStudio'))
 
+progs += Program('air', _('Air'),
+                 Native('air'),
+                 Toolbox('Air'))
+
 progs += Program('aqua', _('Aqua'),
                  Native('aqua'),
                  Toolbox('Aqua'))
