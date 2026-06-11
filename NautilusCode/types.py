@@ -18,10 +18,30 @@ class NamedList (dict):
         return self.keys()
 
 
+class Priority:
+    '''Named priority levels for package deduplication.  Higher value wins on
+     an identity collision, so the base default (FALLBACK) is the lowest and
+     any package type added without an explicit priority safely loses.  Values
+     are spaced so new levels can be slotted in between without renumbering.'''
+    FALLBACK = 0
+    NORMAL = 10
+    PREFERRED = 20
+
+
 class Package:
     run_command: tuple[str]
     is_installed: bool
     type_name = _('Unknown')
+    priority = Priority.FALLBACK
+
+    @property
+    def identity (self):
+        '''The set of values that identify the actual program being launched.
+           Each package describes only itself; two installed packages are
+           considered the same install when their identity sets intersect.  On
+           a collision the one with the higher priority wins and the other is
+           dropped by _dedupe.  Return an empty set to opt out of dedup.'''
+        return frozenset()
 
     @property
     def type_name_raw (self):
@@ -33,6 +53,7 @@ class Package:
 
 class Native (Package):
     type_name = _('Native')
+    priority = Priority.PREFERRED
     cmd_path = ''
 
     def __init__ (self, *commands):
@@ -51,6 +72,15 @@ class Native (Package):
     @property
     def is_installed (self):
         return bool(self.cmd_path)
+
+    @property
+    def identity (self):
+        '''The real executable this command resolves to.  Knows nothing about
+           any other package type; it is up to e.g. Toolbox to declare that it
+           also owns a launcher on PATH that resolves here.'''
+        if not self.cmd_path:
+            return frozenset()
+        return frozenset({os.path.realpath(self.cmd_path)})
 
     def __str__ (self):
         lines = super().__str__().splitlines()
@@ -104,11 +134,13 @@ class Toolbox (Package):
     def __init__ (self, *tool_ids):
       self.tool_ids = tool_ids
       self.launch_command = ''
+      self.install_location = ''
       for tool in self._load_tools():
         if tool.get('toolId') in tool_ids:
           cmd = tool.get('launchCommand', '')
           if cmd and os.path.exists(cmd):
             self.launch_command = cmd
+            self.install_location = tool.get('installLocation', '')
             break
 
     @property
@@ -121,29 +153,43 @@ class Toolbox (Package):
     def is_installed (self) -> bool:
         return bool(self.launch_command)
 
-    def is_shadowed_by (self, native) -> bool:
-        '''Whether the given installed Native package actually refers to this
-           same Toolbox installation. Toolbox adds shell-script launchers to
-           PATH, so `Native` detection happily resolves e.g. `pycharm` to a
-           Toolbox-generated script. In that case both packages launch the
-           exact same IDE and should not be listed twice.'''
-        if not (self.is_installed and native and native.is_installed):
-            return False
+    @property
+    def identity (self):
+        '''The launcher executable plus every launcher Toolbox dropped on PATH
+           that points at this install.  By declaring the PATH launchers it
+           owns, a Native command that resolves to one of them collides with
+           this entry without Native needing to know Toolbox exists.'''
+        if not self.launch_command:
+            return frozenset()
+        ids = {os.path.realpath(self.launch_command)}
+        ids.update(self._owned_scripts())
+        return frozenset(ids)
 
-        native_path = os.path.normpath(native.cmd_path)
-
-        # The resolved Native command lives inside the Toolbox scripts folder,
-        # i.e. it *is* a Toolbox-generated launcher.
-        if os.path.dirname(native_path) == self.scripts_dir():
-            return True
-
-        # The Native command and the Toolbox launcher ultimately resolve to the
-        # very same executable (e.g. a symlink pointing straight at the app).
-        if (os.path.realpath(native_path)
-                == os.path.realpath(self.launch_command)):
-            return True
-
-        return False
+    def _owned_scripts (self):
+        '''Real paths of launchers in the Toolbox scripts dir that start this
+           install.  Toolbox writes either a symlink into the install dir or a
+           wrapper shell script that execs the launchCommand, so both forms are
+           recognised here.'''
+        owned = set()
+        install = os.path.realpath(self.install_location) if self.install_location else ''
+        try:
+            entries = list(os.scandir(self.scripts_dir()))
+        except OSError:
+            return owned
+        for entry in entries:
+            real = os.path.realpath(entry.path)
+            # Symlink launcher resolving into this install dir.
+            if install and (real == install or real.startswith(install + os.sep)):
+                owned.add(real)
+                continue
+            # Wrapper script launcher that execs this install's launchCommand.
+            try:
+                with open(entry.path, encoding='utf-8', errors='ignore') as f:
+                    if self.launch_command in f.read():
+                        owned.add(real)
+            except OSError:
+                pass
+        return owned
 
     def __str__ (self):
         lines = super().__str__().splitlines()
@@ -156,6 +202,7 @@ class Toolbox (Package):
 
 class Flatpak (Package):
     type_name = _('Flatpak')
+    priority = Priority.FALLBACK
     flatpak_path = GLib.find_program_in_path('flatpak') or ''
     flatpak_bin_dirs = None
 
@@ -200,6 +247,12 @@ class Flatpak (Package):
 
         return False
 
+    @property
+    def identity (self):
+        # Flatpak apps are sandboxed; their identity can never collide with a
+        # filesystem path used by Native or Toolbox packages.
+        return frozenset({('flatpak', self.app_id)})
+
     def __str__ (self):
         lines = super().__str__().splitlines()
         lines.insert(-1, f"  app_id = {self.app_id}")
@@ -230,17 +283,21 @@ class Program:
            already represented by another package, so the same IDE is not
            offered twice in the menu.
 
-           JetBrains Toolbox is the main offender: it drops launcher scripts
-           into a directory on PATH, so a Toolbox install is detected both as
-           `Toolbox` (via state.json) and as `Native` (via that script). When
-           that happens we keep `Native` and drop the `Toolbox` duplicate, which
-           effectively turns Toolbox into a fallback that only shows up when its
-           launcher is not on PATH.'''
-        native = next((p for p in pkgs if isinstance(p, Native)), None)
-        if native:
-            pkgs = [p for p in pkgs
-                    if not (isinstance(p, Toolbox) and p.is_shadowed_by(native))]
-        return pkgs
+           Each Package subclass declares an `identity` set (the things it
+           launches) and a `priority` (which representation wins on a
+           collision).  Two installed packages are duplicates when their
+           identity sets intersect; the lower-priority one is dropped.  An
+           empty identity set never collides with anything.'''
+        kept = []
+        kept_identities = []
+        for pkg in sorted(pkgs, key=lambda p: -p.priority):
+            ident = pkg.identity
+            if ident and any(ident & seen for seen in kept_identities):
+                continue
+            kept.append(pkg)
+            if ident:
+                kept_identities.append(ident)
+        return [p for p in pkgs if p in kept]
 
     def add (self, pkg):
         self.packages[pkg.type_name_raw] = pkg
