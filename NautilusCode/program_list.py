@@ -2,6 +2,20 @@ from gettext import gettext as _
 
 from .types import ProgramList, Program, Native, Flatpak, Toolbox
 
+# Deduplication is global (see ProgramList.get_menu_items): the same physical
+# install surfaced under two entries collapses to its highest-priority package.
+# Native/Toolbox installs collide automatically via resolved real paths and
+# shared install dirs, so no per-IDE configuration is needed for them.
+#
+# Flatpak is sandboxed and is treated as a genuinely separate install by
+# default, so a Flatpak and a native of the same IDE intentionally remain two
+# entries.  To opt a specific IDE into Flatpak<->native merging, pass a shared
+# `alias` to both packages, e.g.:
+#     Native('rider', alias='rider')
+#     Flatpak('com.jetbrains.Rider', alias='rider')
+# Their identities then intersect and the native (higher priority) wins.  No
+# IDE is aliased by default.
+
 progs = ProgramList()
 
 progs += Program('code-oss', _('Code-OSS'),

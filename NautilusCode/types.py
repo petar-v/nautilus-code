@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from gettext import gettext as _
 
 from gi.repository import Nautilus
@@ -7,6 +8,83 @@ from gi.repository import GLib
 
 
 user_data_dir = GLib.get_user_data_dir()
+
+
+# Roots that are shared by many unrelated programs.  An install token must
+# never be derived from these, otherwise two distinct products that happen to
+# live under e.g. /usr would be wrongly merged.
+_SYSTEM_ROOTS = frozenset({
+    '/', '/usr', '/usr/local', '/opt', '/bin', '/sbin',
+    '/usr/bin', '/usr/sbin', '/usr/local/bin',
+    os.path.normpath(os.path.expanduser('~')),
+    os.path.normpath(os.path.join(os.path.expanduser('~'), '.local')),
+})
+
+# Matches a quoted token in a shell wrapper, e.g. "/opt/app/bin/app" "$@".
+_QUOTED = re.compile(r'"([^"]+)"|\'([^\']+)\'')
+
+
+def _wrapper_target (path):
+    '''If `path` is a small shell wrapper that execs a quoted absolute
+       executable (the form Toolbox and many distro launchers use), return that
+       executable.  Returns None when `path` is not such a wrapper or cannot be
+       read/parsed.'''
+    try:
+        if os.path.getsize(path) > 65536:
+            return None
+        with open(path, encoding='utf-8', errors='ignore') as f:
+            head = f.read(8192)
+    except OSError:
+        return None
+    if not head.startswith('#!'):
+        return None
+    for match in _QUOTED.finditer(head):
+        candidate = match.group(1) or match.group(2)
+        if candidate and os.path.isabs(candidate) and os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def resolve_launcher (path):
+    '''Resolve a launcher path to the real executable it ultimately starts.
+
+       Follows symlinks and, when the target is a small shell wrapper that
+       execs another quoted executable, follows that one level too.  Distro
+       agnostic: it never looks at hard-coded prefixes.  Degrades to the
+       resolved real path (or the input) on any error so callers can treat the
+       result as "unique" rather than crash.'''
+    try:
+        real = os.path.realpath(path)
+    except OSError:
+        return path
+    target = _wrapper_target(real)
+    if target:
+        try:
+            return os.path.realpath(target)
+        except OSError:
+            return target
+    return real
+
+
+def install_token (real_path):
+    '''Return a stable token for the install directory that owns `real_path`,
+       or None when it cannot be determined from an authoritative layout.
+
+       Uses the conventional `<install>/bin/<exe>` layout shared by the
+       JetBrains IDEs (and most self-contained app bundles).  System roots such
+       as /usr or /usr/local are deliberately excluded so two unrelated
+       programs installed there are never merged.'''
+    try:
+        real = os.path.realpath(real_path)
+    except OSError:
+        return None
+    parent = os.path.dirname(real)
+    if os.path.basename(parent) != 'bin':
+        return None
+    root = os.path.dirname(parent)
+    if not root or os.path.normpath(root) in _SYSTEM_ROOTS:
+        return None
+    return ('install', os.path.normpath(root))
 
 
 class NamedList (dict):
@@ -56,8 +134,10 @@ class Native (Package):
     priority = Priority.PREFERRED
     cmd_path = ''
 
-    def __init__ (self, *commands):
+    def __init__ (self, *commands, alias=None):
       self.commands = commands
+      self.alias = alias
+      self._identity = None
       for cmd in commands:
         if cmd_path := GLib.find_program_in_path(cmd):
           self.cmd_path = cmd_path
@@ -75,12 +155,24 @@ class Native (Package):
 
     @property
     def identity (self):
-        '''The real executable this command resolves to.  Knows nothing about
-           any other package type; it is up to e.g. Toolbox to declare that it
-           also owns a launcher on PATH that resolves here.'''
+        '''The real executable this command resolves to, plus the install dir
+           that owns it.  `resolve_launcher` follows symlinks and shell wrappers
+           so e.g. `/usr/bin/pycharm-eap` -> `.../bin/pycharm.sh` lands on the
+           true binary, and the install token lets `.sh` vs non-`.sh` siblings
+           of one install collide.  An optional `alias` token enables opt-in
+           dedup against another package (e.g. a Flatpak of the same IDE).'''
         if not self.cmd_path:
             return frozenset()
-        return frozenset({os.path.realpath(self.cmd_path)})
+        if self._identity is None:
+            real = resolve_launcher(self.cmd_path)
+            ids = {real}
+            token = install_token(real)
+            if token:
+                ids.add(token)
+            if self.alias:
+                ids.add(('alias', self.alias))
+            self._identity = frozenset(ids)
+        return self._identity
 
     def __str__ (self):
         lines = super().__str__().splitlines()
@@ -135,6 +227,7 @@ class Toolbox (Package):
       self.tool_ids = tool_ids
       self.launch_command = ''
       self.install_location = ''
+      self._identity = None
       for tool in self._load_tools():
         if tool.get('toolId') in tool_ids:
           cmd = tool.get('launchCommand', '')
@@ -161,9 +254,22 @@ class Toolbox (Package):
            this entry without Native needing to know Toolbox exists.'''
         if not self.launch_command:
             return frozenset()
-        ids = {os.path.realpath(self.launch_command)}
-        ids.update(self._owned_scripts())
-        return frozenset(ids)
+        if self._identity is None:
+            ids = {os.path.realpath(self.launch_command)}
+            ids.update(self._owned_scripts())
+            # The install dir is authoritative for this tool, so siblings such
+            # as bin/pycharm vs bin/pycharm.sh of the same install collide via
+            # the shared install token even though they are different files.
+            token = None
+            if self.install_location:
+                token = ('install', os.path.normpath(
+                    os.path.realpath(self.install_location)))
+            if not token:
+                token = install_token(self.launch_command)
+            if token:
+                ids.add(token)
+            self._identity = frozenset(ids)
+        return self._identity
 
     def _owned_scripts (self):
         '''Real paths of launchers in the Toolbox scripts dir that start this
@@ -206,8 +312,9 @@ class Flatpak (Package):
     flatpak_path = GLib.find_program_in_path('flatpak') or ''
     flatpak_bin_dirs = None
 
-    def __init__ (self, app_id: str):
+    def __init__ (self, app_id: str, alias=None):
       self.app_id = app_id
+      self.alias = alias
       self._calculate_bin_dirs()
 
     def _calculate_bin_dirs(self):
@@ -249,14 +356,39 @@ class Flatpak (Package):
 
     @property
     def identity (self):
-        # Flatpak apps are sandboxed; their identity can never collide with a
-        # filesystem path used by Native or Toolbox packages.
-        return frozenset({('flatpak', self.app_id)})
+        # Flatpak apps are sandboxed; their app-id token can never collide with
+        # a filesystem path used by Native or Toolbox packages.  An optional
+        # `alias` token opts this Flatpak into dedup against another package
+        # (e.g. a native install of the same IDE) when a program declares it.
+        ids = {('flatpak', self.app_id)}
+        if self.alias:
+            ids.add(('alias', self.alias))
+        return frozenset(ids)
 
     def __str__ (self):
         lines = super().__str__().splitlines()
         lines.insert(-1, f"  app_id = {self.app_id}")
         return  '\n'.join(lines)
+
+
+def _dedupe_by_identity (items, package_of):
+    '''Identity-intersection dedup shared by per-program and global dedup.
+
+       `items` is any iterable and `package_of(item)` yields its Package.  Items
+       are processed highest-priority first; an item is dropped when its
+       package identity set intersects one already kept, so the same physical
+       install is represented once by its highest-priority package.  An empty
+       identity set never collides.  Original order is preserved.'''
+    kept = []
+    kept_identities = []
+    for item in sorted(items, key=lambda it: -package_of(it).priority):
+        ident = package_of(item).identity
+        if ident and any(ident & seen for seen in kept_identities):
+            continue
+        kept.append(item)
+        if ident:
+            kept_identities.append(ident)
+    return [it for it in items if it in kept]
 
 
 class Program:
@@ -279,25 +411,11 @@ class Program:
 
     @staticmethod
     def _dedupe (pkgs):
-        '''Remove packages that are merely a different "view" of an install
-           already represented by another package, so the same IDE is not
-           offered twice in the menu.
-
-           Each Package subclass declares an `identity` set (the things it
-           launches) and a `priority` (which representation wins on a
-           collision).  Two installed packages are duplicates when their
-           identity sets intersect; the lower-priority one is dropped.  An
-           empty identity set never collides with anything.'''
-        kept = []
-        kept_identities = []
-        for pkg in sorted(pkgs, key=lambda p: -p.priority):
-            ident = pkg.identity
-            if ident and any(ident & seen for seen in kept_identities):
-                continue
-            kept.append(pkg)
-            if ident:
-                kept_identities.append(ident)
-        return [p for p in pkgs if p in kept]
+        '''Per-program convenience dedup.  The menu uses the global
+           `ProgramList._dedupe_pairs` instead, which also catches the same
+           install surfaced under two different programs; this remains for
+           callers that inspect a single program's installed packages.'''
+        return _dedupe_by_identity(pkgs, lambda p: p)
 
     def add (self, pkg):
         self.packages[pkg.type_name_raw] = pkg
@@ -328,26 +446,44 @@ class ProgramList (NamedList):
         pid, *io = GLib.spawn_async(command)
         GLib.spawn_close_pid(pid)
 
-    def get_menu_items (self, path, *, id_prefix='', is_file=False):
-        items = []
+    @staticmethod
+    def _dedupe_pairs (pairs):
+        '''Global dedup over (program, package) pairs.  Runs the shared
+           identity-intersection algorithm across every installed package of
+           every program, so a single install surfaced under two different
+           programs (e.g. an EAP adopted by Toolbox under the stable program and
+           detected natively under the EAP program) collapses to one entry.'''
+        return _dedupe_by_identity(pairs, lambda pp: pp[1])
 
+    def get_menu_items (self, path, *, id_prefix='', is_file=False):
+        pairs = []
         for program in self:
             if is_file and not program.supports_files:
                 continue
+            for pkg in program.packages:
+                if pkg.is_installed:
+                    pairs.append((program, pkg))
 
-            installed_pkgs = program.installed_packages
-            include_type_name = True if len(installed_pkgs) > 1 else False
-            for pkg in installed_pkgs:
+        pairs = self._dedupe_pairs(pairs)
 
-                name = id_prefix + program.id
-                command = [*pkg.run_command, *program.arguments, path]
-                label = _('Open in %s') % program.name
-                if include_type_name:
-                    label += f' ({pkg.type_name})'
+        # Count surviving packages per program so the (Type) suffix is only
+        # added when a program still has more than one distinct package after
+        # global dedup.
+        survivors = {}
+        for program, pkg in pairs:
+            survivors[program.id] = survivors.get(program.id, 0) + 1
 
-                item = Nautilus.MenuItem.new(name, label)
-                item.connect('activate', self._activate_item, command)
-                items.append(item)
+        items = []
+        for program, pkg in pairs:
+            name = id_prefix + program.id
+            command = [*pkg.run_command, *program.arguments, path]
+            label = _('Open in %s') % program.name
+            if survivors[program.id] > 1:
+                label += f' ({pkg.type_name})'
+
+            item = Nautilus.MenuItem.new(name, label)
+            item.connect('activate', self._activate_item, command)
+            items.append(item)
 
         return items
 
