@@ -63,8 +63,11 @@ class Native (Package):
 
 class Toolbox (Package):
     type_name = _('Toolbox')
-    state_file = os.path.join(user_data_dir, 'JetBrains', 'Toolbox', 'state.json')
+    toolbox_dir = os.path.join(user_data_dir, 'JetBrains', 'Toolbox')
+    state_file = os.path.join(toolbox_dir, 'state.json')
+    settings_file = os.path.join(toolbox_dir, '.settings.json')
     _tools = None
+    _scripts_dir = None
 
     @classmethod
     def _load_tools (cls):
@@ -75,6 +78,28 @@ class Toolbox (Package):
             except (OSError, ValueError):
                 cls._tools = []
         return cls._tools
+
+    @classmethod
+    def scripts_dir (cls):
+        '''Directory where Toolbox writes the shell-script launchers it adds
+           to PATH. The location is user-configurable in Toolbox settings and
+           defaults to the "scripts" folder next to state.json.'''
+        if cls._scripts_dir is None:
+            cls._scripts_dir = os.path.normpath(cls._read_scripts_location())
+        return cls._scripts_dir
+
+    @classmethod
+    def _read_scripts_location (cls):
+        '''Read the configured shell-scripts location from Toolbox settings,
+           falling back to the default "scripts" folder next to state.json
+           when the settings file is missing, unreadable, or unset.'''
+        default = os.path.join(cls.toolbox_dir, 'scripts')
+        try:
+            with open(cls.settings_file, encoding='utf-8') as f:
+                settings = json.load(f)
+        except (OSError, ValueError):
+            return default
+        return (settings.get('shell_scripts') or {}).get('location') or default
 
     def __init__ (self, *tool_ids):
       self.tool_ids = tool_ids
@@ -95,6 +120,30 @@ class Toolbox (Package):
     @property
     def is_installed (self) -> bool:
         return bool(self.launch_command)
+
+    def is_shadowed_by (self, native) -> bool:
+        '''Whether the given installed Native package actually refers to this
+           same Toolbox installation. Toolbox adds shell-script launchers to
+           PATH, so `Native` detection happily resolves e.g. `pycharm` to a
+           Toolbox-generated script. In that case both packages launch the
+           exact same IDE and should not be listed twice.'''
+        if not (self.is_installed and native and native.is_installed):
+            return False
+
+        native_path = os.path.normpath(native.cmd_path)
+
+        # The resolved Native command lives inside the Toolbox scripts folder,
+        # i.e. it *is* a Toolbox-generated launcher.
+        if os.path.dirname(native_path) == self.scripts_dir():
+            return True
+
+        # The Native command and the Toolbox launcher ultimately resolve to the
+        # very same executable (e.g. a symlink pointing straight at the app).
+        if (os.path.realpath(native_path)
+                == os.path.realpath(self.launch_command)):
+            return True
+
+        return False
 
     def __str__ (self):
         lines = super().__str__().splitlines()
@@ -173,6 +222,24 @@ class Program:
         for pkg in self.packages:
             if pkg.is_installed:
                 pkgs.append(pkg)
+        return self._dedupe(pkgs)
+
+    @staticmethod
+    def _dedupe (pkgs):
+        '''Remove packages that are merely a different "view" of an install
+           already represented by another package, so the same IDE is not
+           offered twice in the menu.
+
+           JetBrains Toolbox is the main offender: it drops launcher scripts
+           into a directory on PATH, so a Toolbox install is detected both as
+           `Toolbox` (via state.json) and as `Native` (via that script). When
+           that happens we keep `Native` and drop the `Toolbox` duplicate, which
+           effectively turns Toolbox into a fallback that only shows up when its
+           launcher is not on PATH.'''
+        native = next((p for p in pkgs if isinstance(p, Native)), None)
+        if native:
+            pkgs = [p for p in pkgs
+                    if not (isinstance(p, Toolbox) and p.is_shadowed_by(native))]
         return pkgs
 
     def add (self, pkg):
