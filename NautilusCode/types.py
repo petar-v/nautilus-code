@@ -33,6 +33,17 @@ class Package:
     is_installed: bool
     type_name = _('Unknown')
     priority = Priority.FALLBACK
+    show_type_name = True
+
+    def menu_label (self, program_name, *, disambiguate=False):
+        '''Build the menu label for launching `program_name` via this package.
+           When `disambiguate` is set (more than one install of the program is
+           shown) and this package type wants it, the type name is appended so
+           the entries can be told apart.'''
+        label = _('Open in %s') % program_name
+        if disambiguate and self.show_type_name:
+            label += f' ({self.type_name})'
+        return label
 
     @property
     def identity (self):
@@ -54,6 +65,7 @@ class Package:
 class Native (Package):
     type_name = _('Native')
     priority = Priority.PREFERRED
+    show_type_name = False
     cmd_path = ''
 
     def __init__ (self, *commands):
@@ -341,9 +353,7 @@ class ProgramList (NamedList):
 
                 name = id_prefix + program.id
                 command = [*pkg.run_command, *program.arguments, path]
-                label = _('Open in %s') % program.name
-                if include_type_name:
-                    label += f' ({pkg.type_name})'
+                label = pkg.menu_label(program.name, disambiguate=include_type_name)
 
                 item = Nautilus.MenuItem.new(name, label)
                 item.connect('activate', self._activate_item, command)
